@@ -14,18 +14,7 @@ interface RoomStore {
 const rooms = new Map<string, RoomStore>();
 const socketsByRoom = new Map<string, Set<{ ws: WebSocket; participantId: string; nickname: string }>>();
 
-// Periodic cleanup of expired rooms every 2 seconds
-setInterval(() => {
-  const now = Date.now();
-  for (const [id, store] of rooms.entries()) {
-    if (new Date(store.room.expires_at).getTime() <= now) {
-      // Broadcast expired to all connected clients
-      broadcastToRoom(id, { type: 'EXPIRED', roomId: id });
-      rooms.delete(id);
-      socketsByRoom.delete(id);
-    }
-  }
-}, 2000);
+let cleanupInterval: NodeJS.Timeout | null = null;
 
 function broadcastToRoom(roomId: string, data: any, excludeWs?: WebSocket) {
   const list = socketsByRoom.get(roomId);
@@ -86,7 +75,29 @@ function sendJson(res: ServerResponse, status: number, data: any) {
 export function tempChatServerPlugin(): Plugin {
   return {
     name: 'tempchat-server-plugin',
+    apply: 'serve',
     configureServer(server) {
+      if (!cleanupInterval) {
+        cleanupInterval = setInterval(() => {
+          const now = Date.now();
+          for (const [id, store] of rooms.entries()) {
+            if (new Date(store.room.expires_at).getTime() <= now) {
+              broadcastToRoom(id, { type: 'EXPIRED', roomId: id });
+              rooms.delete(id);
+              socketsByRoom.delete(id);
+            }
+          }
+        }, 2000);
+        cleanupInterval.unref();
+      }
+
+      server.httpServer?.on('close', () => {
+        if (cleanupInterval) {
+          clearInterval(cleanupInterval);
+          cleanupInterval = null;
+        }
+      });
+
       // 1. Setup HTTP API Middleware
       server.middlewares.use(async (req, res, next) => {
         const url = req.url || '';

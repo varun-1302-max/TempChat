@@ -5,16 +5,66 @@ import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import { WebSocketServer, WebSocket } from 'ws';
 
+export interface Room {
+  id: string;
+  room_token: string;
+  expires_at: string;
+  last_activity_at: string;
+  created_at: string;
+}
+
+export interface Participant {
+  id: string;
+  room_id: string;
+  nickname: string;
+  session_token: string;
+  joined_at: string;
+  last_seen_at: string;
+}
+
+export interface Message {
+  id: string;
+  room_id: string;
+  participant_id: string;
+  nickname: string;
+  content: string;
+  created_at: string;
+  is_system?: boolean;
+}
+
+export interface TypingUser {
+  participantId: string;
+  nickname: string;
+  lastTypingAt: number;
+}
+
+interface RoomStore {
+  room: Room;
+  participants: Map<string, Participant>;
+  messages: Message[];
+  typingUsers: Map<string, TypingUser>;
+}
+
+interface SocketClient {
+  ws: WebSocket;
+  participantId: string;
+  nickname: string;
+}
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const DIST_DIR = path.resolve(__dirname, '../dist');
+// In compiled dist-server/index.js, DIST_DIR is ../dist
+// When running from root or dist-server, fallback cleanly
+const DIST_DIR = fs.existsSync(path.resolve(__dirname, '../dist'))
+  ? path.resolve(__dirname, '../dist')
+  : path.resolve(process.cwd(), 'dist');
 
-// In-memory room storage for multi-client real-time sync
-const rooms = new Map();
-const socketsByRoom = new Map();
+// In-memory room store for ephemeral multi-device real-time chat
+const rooms = new Map<string, RoomStore>();
+const socketsByRoom = new Map<string, Set<SocketClient>>();
 
 // Periodic cleanup of expired rooms every 2 seconds
-setInterval(() => {
+const cleanupTimer = setInterval(() => {
   const now = Date.now();
   for (const [id, store] of rooms.entries()) {
     if (new Date(store.room.expires_at).getTime() <= now) {
@@ -24,8 +74,9 @@ setInterval(() => {
     }
   }
 }, 2000);
+cleanupTimer.unref();
 
-function broadcastToRoom(roomId, data, excludeWs) {
+function broadcastToRoom(roomId: string, data: unknown, excludeWs?: WebSocket): void {
   const list = socketsByRoom.get(roomId);
   if (!list) return;
   const payload = JSON.stringify(data);
@@ -36,7 +87,7 @@ function broadcastToRoom(roomId, data, excludeWs) {
   }
 }
 
-function normalizeServerToken(raw) {
+function normalizeServerToken(raw: string): string {
   let t = (raw || '').trim().toLowerCase();
   if (t.includes('room=')) {
     const match = t.match(/room=([a-z0-9_-]+)/i);
@@ -52,7 +103,7 @@ function normalizeServerToken(raw) {
   return t;
 }
 
-function generateToken() {
+function generateToken(): string {
   const chars = '23456789abcdefghjkmnpqrstuvwxyz';
   let p1 = '';
   let p2 = '';
@@ -61,17 +112,23 @@ function generateToken() {
   return `tc-${p1}-${p2}`;
 }
 
-function parseJsonBody(req) {
+function parseJsonBody(req: http.IncomingMessage): Promise<Record<string, any>> {
   return new Promise((resolve) => {
     let body = '';
-    req.on('data', (chunk) => { body += chunk; });
+    req.on('data', (chunk) => {
+      body += chunk;
+    });
     req.on('end', () => {
-      try { resolve(JSON.parse(body)); } catch { resolve({}); }
+      try {
+        resolve(JSON.parse(body));
+      } catch {
+        resolve({});
+      }
     });
   });
 }
 
-function sendJson(res, status, data) {
+function sendJson(res: http.ServerResponse, status: number, data: unknown): void {
   res.statusCode = status;
   res.setHeader('Content-Type', 'application/json');
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -80,7 +137,7 @@ function sendJson(res, status, data) {
   res.end(JSON.stringify(data));
 }
 
-const MIME_TYPES = {
+const MIME_TYPES: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'application/javascript; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
@@ -95,8 +152,8 @@ const MIME_TYPES = {
   '.ttf': 'font/ttf',
 };
 
-// Create HTTP Server
-const server = http.createServer(async (req, res) => {
+// Create Production HTTP Server
+export const server = http.createServer(async (req, res) => {
   const url = req.url || '';
 
   // CORS preflight
@@ -123,7 +180,7 @@ const server = http.createServer(async (req, res) => {
     const now = new Date();
     const expiresAt = new Date(now.getTime() + duration * 60 * 1000);
 
-    const room = {
+    const room: Room = {
       id,
       room_token: token,
       expires_at: expiresAt.toISOString(),
@@ -131,7 +188,7 @@ const server = http.createServer(async (req, res) => {
       created_at: now.toISOString(),
     };
 
-    const participant = {
+    const participant: Participant = {
       id: crypto.randomUUID(),
       room_id: id,
       nickname,
@@ -140,7 +197,7 @@ const server = http.createServer(async (req, res) => {
       last_seen_at: now.toISOString(),
     };
 
-    const store = {
+    const store: RoomStore = {
       room,
       participants: new Map([[participant.id, participant]]),
       messages: [],
@@ -153,7 +210,13 @@ const server = http.createServer(async (req, res) => {
   }
 
   // GET ROOM BY TOKEN: GET /api/rooms/:token
-  if (req.method === 'GET' && url.startsWith('/api/rooms/') && !url.includes('/messages') && !url.includes('/join') && !url.includes('/leave')) {
+  if (
+    req.method === 'GET' &&
+    url.startsWith('/api/rooms/') &&
+    !url.includes('/messages') &&
+    !url.includes('/join') &&
+    !url.includes('/leave')
+  ) {
     const token = normalizeServerToken(url.replace('/api/rooms/', '').split('?')[0]);
 
     for (const store of rooms.values()) {
@@ -183,7 +246,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    let targetStore = null;
+    let targetStore: RoomStore | null = null;
     for (const store of rooms.values()) {
       if (store.room.room_token.toLowerCase() === token) {
         targetStore = store;
@@ -197,7 +260,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     const now = new Date();
-    const participant = {
+    const participant: Participant = {
       id: crypto.randomUUID(),
       room_id: targetStore.room.id,
       nickname,
@@ -218,7 +281,10 @@ const server = http.createServer(async (req, res) => {
     broadcastToRoom(targetStore.room.id, {
       type: 'PARTICIPANTS',
       roomId: targetStore.room.id,
-      participants: Array.from(targetStore.participants.values()).map(p => ({ id: p.id, nickname: p.nickname })),
+      participants: Array.from(targetStore.participants.values()).map((p) => ({
+        id: p.id,
+        nickname: p.nickname,
+      })),
     });
 
     sendJson(res, 200, { room: targetStore.room, participant });
@@ -260,7 +326,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     const now = new Date();
-    const message = {
+    const message: Message = {
       id: crypto.randomUUID(),
       room_id: roomId,
       participant_id: participantId,
@@ -302,7 +368,10 @@ const server = http.createServer(async (req, res) => {
       broadcastToRoom(roomId, {
         type: 'PARTICIPANTS',
         roomId,
-        participants: Array.from(store.participants.values()).map(p => ({ id: p.id, nickname: p.nickname })),
+        participants: Array.from(store.participants.values()).map((p) => ({
+          id: p.id,
+          nickname: p.nickname,
+        })),
       });
     }
 
@@ -322,9 +391,9 @@ const server = http.createServer(async (req, res) => {
 
   // --- STATIC FILE SERVING FOR PRODUCTION SPA ---
   const parsedPath = url.split('?')[0];
-  let filePath = path.join(DIST_DIR, parsedPath === '/' ? 'index.html' : parsedPath);
+  const filePath = path.join(DIST_DIR, parsedPath === '/' ? 'index.html' : parsedPath);
 
-  // Check if file exists in dist
+  // Serve static file if it exists
   if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
     const ext = path.extname(filePath).toLowerCase();
     const mimeType = MIME_TYPES[ext] || 'application/octet-stream';
@@ -350,11 +419,13 @@ const server = http.createServer(async (req, res) => {
   res.end('Not found');
 });
 
-// Setup WebSocket Server for Real-time multi-device sync
-const wss = new WebSocketServer({ noServer: true });
+// Setup WebSocket Server for Real-Time Multi-Device Sync
+export const wss = new WebSocketServer({ noServer: true });
 
 server.on('upgrade', (req, socket, head) => {
-  const parsedUrl = new URL(req.url || '', `http://${req.headers.host || 'localhost'}`);
+  const hostHeader = req.headers.host || 'localhost';
+  const parsedUrl = new URL(req.url || '', `http://${hostHeader}`);
+
   if (parsedUrl.pathname === '/tempchat-ws') {
     wss.handleUpgrade(req, socket, head, (ws) => {
       wss.emit('connection', ws, req);
@@ -364,8 +435,9 @@ server.on('upgrade', (req, socket, head) => {
   }
 });
 
-wss.on('connection', (ws, req) => {
-  const parsedUrl = new URL(req.url || '', `http://${req.headers.host || 'localhost'}`);
+wss.on('connection', (ws: WebSocket, req: http.IncomingMessage) => {
+  const hostHeader = req.headers.host || 'localhost';
+  const parsedUrl = new URL(req.url || '', `http://${hostHeader}`);
   const roomId = parsedUrl.searchParams.get('roomId') || '';
   const participantId = parsedUrl.searchParams.get('participantId') || '';
   const nickname = parsedUrl.searchParams.get('nickname') || '';
@@ -378,14 +450,17 @@ wss.on('connection', (ws, req) => {
   if (!socketsByRoom.has(roomId)) {
     socketsByRoom.set(roomId, new Set());
   }
-  const roomSockets = socketsByRoom.get(roomId);
-  const clientEntry = { ws, participantId, nickname };
+  const roomSockets = socketsByRoom.get(roomId)!;
+  const clientEntry: SocketClient = { ws, participantId, nickname };
   roomSockets.add(clientEntry);
 
   // Send initial active participants list
   const store = rooms.get(roomId);
   if (store) {
-    const online = Array.from(store.participants.values()).map(p => ({ id: p.id, nickname: p.nickname }));
+    const online = Array.from(store.participants.values()).map((p) => ({
+      id: p.id,
+      nickname: p.nickname,
+    }));
     ws.send(JSON.stringify({ type: 'PARTICIPANTS', roomId, participants: online }));
   }
 
@@ -393,14 +468,18 @@ wss.on('connection', (ws, req) => {
     try {
       const data = JSON.parse(raw.toString());
       if (data.type === 'TYPING') {
-        broadcastToRoom(roomId, {
-          type: 'TYPING',
+        broadcastToRoom(
           roomId,
-          typingUsers: data.typingUsers || [],
-        }, ws);
+          {
+            type: 'TYPING',
+            roomId,
+            typingUsers: data.typingUsers || [],
+          },
+          ws
+        );
       }
     } catch {
-      // Ignore malformed
+      // Ignore malformed JSON
     }
   });
 
@@ -416,5 +495,5 @@ const PORT = Number(process.env.PORT) || 3000;
 const HOST = '0.0.0.0';
 
 server.listen(PORT, HOST, () => {
-  console.log(`🚀 TempChat Production Server running at http://${HOST}:${PORT}`);
+  console.log(`🚀 TempChat Production Server listening on http://${HOST}:${PORT}`);
 });
